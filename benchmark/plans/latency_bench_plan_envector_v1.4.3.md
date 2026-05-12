@@ -75,16 +75,20 @@ Total end-to-end
 > T13 = 2-phase (DB + 캐시 레이어 두 단계 결정)
 > T14 = 5-phase (마이크로서비스 전환 ADR 수준 복잡 결정)
 
-### Feature 5: `searchable` (insert → MERGED_SAVED 대기)
+### Feature 5: `searchable` (insert → 서버 내부 상태 `MERGED_SAVED` 대기)
+
+> **[`MERGED_SAVED` 정의]** `envector-msa-1.4.3/proto/v2/common/index-operation-message.proto`의 enum 값 `MERGED_SAVED=6`:
+> **"insert request의 모든 vector가 임시(raw) shard에서 정식(non-raw) shard로 전부 이동 완료됐지만, 아직 정식 publish(`LoadIndex`)는 거치지 않은 상태"**
+> (proto에는 `SEARCHABLE=7`이 별도 enum으로 정의되며, pyenvector SDK의 `await_completion`이 둘 중 어느 단계에서 풀어지는지는 SDK 구현 의존 — 본 plan은 위 정의를 기준으로 표기.)
 
 ```
 [1] 텍스트 → Embedding (로컬)
 [2] Novelty Check → envector score (FHE)
 [3] Vault TopK Decrypt (gRPC)
 [4] FHE Encrypt → index.insert(await_searchable=True)
-     — RPC 제출 + 서버 MERGED_SAVED 상태까지 대기 포함
+     — RPC 제출 + 서버 `MERGED_SAVED` 상태까지 대기 포함
 ────
-Total end-to-end (MERGED_SAVED 시점까지)
+Total end-to-end (`MERGED_SAVED` 시점까지)
 ```
 
 > **[주의]** `EnVectorClient.insert()`는 request_id를 반환하지 않으므로

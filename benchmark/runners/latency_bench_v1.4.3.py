@@ -29,9 +29,14 @@ Scenarios (all target ivf_vct index, eval_mode=mm32)
     T13 2-phase batch embed+insert
     T14 5-phase batch embed+insert
   searchable:
-    T10 Short English → MERGED_SAVED
-    T11 Long English  → MERGED_SAVED
-    T12 Korean        → MERGED_SAVED
+    (server-push wait target — `MERGED_SAVED` (=6 in proto): the insert
+     request's vectors have all moved from temporary raw shards into
+     canonical non-raw shards, but have not yet been published via
+     LoadIndex. `SEARCHABLE`=7 is a separate enum. See
+     envector-msa-1.4.3/proto/v2/common/index-operation-message.proto.)
+    T10 Short English
+    T11 Long English
+    T12 Korean
 
 Usage
 -----
@@ -603,13 +608,19 @@ class LatencyBenchmark:
         self, text: str, title: str, domain: str
     ) -> dict[str, float]:
         """
-        Measure time from capture start until data is searchable (MERGED_SAVED).
+        Measure time from capture start until the server reaches the internal
+        state `MERGED_SAVED` — defined as: the insert request's vectors have
+        all moved from temporary raw shards into canonical non-raw shards, but
+        have not yet been published via LoadIndex (proto enum value 6 in
+        envector-msa-1.4.3/proto/v2/common/index-operation-message.proto;
+        `SEARCHABLE`=7 is a separate enum).
 
         Phases:
           embed              — embed locally
           score              — FHE novelty check
           vault_topk         — Vault decrypt
-          insert_searchable  — insert(await_searchable=True): RPC + MERGED_SAVED wait
+          insert_searchable  — insert(await_searchable=True): RPC submission
+                               + server wait until `MERGED_SAVED`
           total              — wall clock including all phases
 
         Note: EnVectorClient.insert() does not return a request_id, so RPC
@@ -636,7 +647,8 @@ class LatencyBenchmark:
 
         metadata = [self._build_insert_metadata(text, title, domain)]
 
-        # Single insert — blocks until MERGED_SAVED (searchable)
+        # Single insert — blocks until the server reaches `MERGED_SAVED`
+        # (raw→non-raw shard transition complete, pre-publish)
         with _Timer() as t_insert:
             self._ev_client.insert(
                 index_name=self._index_name,
@@ -656,7 +668,11 @@ class LatencyBenchmark:
         }
 
     async def run_searchable_scenario(self, scenario: dict) -> LatencyScenarioResult:
-        """T10-T12: measure capture → searchable latency (insert submit + MERGED_SAVED wait)."""
+        """T10-T12: measure capture → searchable latency.
+
+        Wall-clock = insert RPC submission + server wait until `MERGED_SAVED`
+        (raw→non-raw shard transition complete, pre-publish).
+        """
         _parts = scenario["id"].split("_", 1)
         sid = f"T{int(_parts[0][1:]) + 9}_{_parts[1]}_searchable"
         text = scenario["text"]

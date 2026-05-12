@@ -77,9 +77,13 @@ ivf_vct + nprobe 기반 search이지만 topk 변경에 따른 추가 비용은 �
 
 ### ⚠ T10 searchable 첫 시나리오 p95 outlier (median은 정상)
 
+> **[`MERGED_SAVED` 정의 (이 섹션에서 사용)]** `envector-msa-1.4.3/proto/v2/common/index-operation-message.proto`의 enum 값 `MERGED_SAVED=6`:
+> **"insert request의 모든 vector가 임시(raw) shard에서 정식(non-raw) shard로 전부 이동 완료됐지만, 아직 정식 publish(`LoadIndex`)는 거치지 않은 상태"**.
+> proto에는 `SEARCHABLE=7`이 별도 enum으로 존재. 본 리포트의 "`MERGED_SAVED` 대기"는 `insert(await_searchable=True)`가 풀어지는 시점을 가리키며, pyenvector SDK의 `await_completion`이 실제로 `MERGED_SAVED`에서 푸는지 `SEARCHABLE`(done=true)에서 푸는지는 SDK 구현 검증 필요 (rune SDK docstring은 전자로 표기 중).
+
 T10 total: p50 89.5ms, p95 **46238ms**. 첫 searchable scenario에서 8회 측정 중 1–2회가 ~45초로 폭증. T11/T12는 71–88ms로 안정. 원인 후보:
 
-- 이전 capture 단계에서 다량 insert된 데이터의 첫 MERGED_SAVED flush가 await_searchable=True 측정 시점에 트리거됨
+- 이전 capture 단계에서 다량 insert된 데이터의 첫 `MERGED_SAVED` flush가 `await_searchable=True` 측정 시점에 트리거됨
 - 이전 batch 모드 T1 이슈(`async split batch data` UNAVAILABLE)와 같은 서버측 path 초기화 가능성
 
 p50은 정상값이므로 중앙 경향 해석엔 영향 없으나, **search visibility 99분위 SLA를 잡을 때는 별도 측정**이 필요. 단, 본 runner는 await_searchable RPC 제출과 서버 MERGED_SAVED 대기를 분리 측정 불가 (`EnVectorClient.insert()`가 request_id 미반환). 필요 시 `benchmark/runners/insert_row_only.py` 사용.
