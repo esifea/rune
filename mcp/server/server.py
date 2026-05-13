@@ -91,6 +91,56 @@ del _p
 
 from fastmcp import FastMCP, Context  # pip install fastmcp
 from mcp.types import ToolAnnotations
+
+
+def _patch_pyenvector_ready_timeout() -> None:
+    """Override pyenvector's hardcoded 3s channel_ready_future timeout.
+
+    pyenvector 1.4's ``Connection.__init__`` waits only 3s for the gRPC channel
+    to reach READY. Cold-start TLS handshakes against remote enVector Cloud
+    clusters routinely take 3-8s, causing every adapter call to surface as
+    "Failed to connect". Override via ``RUNE_GRPC_READY_TIMEOUT`` (default 30s).
+    """
+    import grpc
+    from pyenvector.api import connection as _pyev_conn
+
+    try:
+        timeout = float(os.environ.get("RUNE_GRPC_READY_TIMEOUT", "30"))
+    except (TypeError, ValueError):
+        timeout = 30.0
+
+    def _patched_init(self, server_address: str, secure: bool = False):
+        opts = [
+            ("grpc.max_receive_message_length", _pyev_conn.MAX_MESSAGE_LENGTH),
+            ("grpc.max_send_message_length", _pyev_conn.MAX_MESSAGE_LENGTH),
+        ]
+        self.server_address = server_address
+        self.secure = bool(secure)
+        with _pyev_conn._suppress_c_core_stderr():
+            if secure:
+                creds = grpc.ssl_channel_credentials()
+                self.channel = grpc.secure_channel(server_address, creds, options=opts)
+            else:
+                self.channel = grpc.insecure_channel(server_address, options=opts)
+            try:
+                grpc.channel_ready_future(self.channel).result(timeout=timeout)
+                self._connected = True
+            except grpc.FutureTimeoutError:
+                self._connected = False
+                try:
+                    self.channel.close()
+                except Exception:
+                    pass
+
+    _pyev_conn.Connection.__init__ = _patched_init
+    logger.info("Patched pyenvector channel-ready timeout to %.0fs", timeout)
+
+
+try:
+    _patch_pyenvector_ready_timeout()
+except Exception as _patch_err:  # pragma: no cover - defensive
+    logger.warning("Could not patch pyenvector ready-timeout: %s", _patch_err)
+
 from adapter import EnVectorSDKAdapter
 from adapter.vault_client import VaultClient, VaultError
 from server.errors import (
