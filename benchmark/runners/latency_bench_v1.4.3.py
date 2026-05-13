@@ -619,8 +619,12 @@ class LatencyBenchmark:
           embed              — embed locally
           score              — FHE novelty check
           vault_topk         — Vault decrypt
-          insert_searchable  — insert(await_searchable=True): RPC submission
-                               + server wait until `MERGED_SAVED`
+          insert_searchable  — insert(use_row_insert=<mode>, await_searchable=True):
+                               RPC submission + server wait until `MERGED_SAVED`.
+                               `use_row_insert` follows the CLI --insert-mode
+                               (single → True, batch → False), so the single
+                               and batch reports exercise different insert
+                               server paths under searchable wait.
           total              — wall clock including all phases
 
         Note: EnVectorClient.insert() does not return a request_id, so RPC
@@ -647,13 +651,18 @@ class LatencyBenchmark:
 
         metadata = [self._build_insert_metadata(text, title, domain)]
 
-        # Single insert — blocks until the server reaches `MERGED_SAVED`
-        # (raw→non-raw shard transition complete, pre-publish)
+        # Honor the CLI --insert-mode so that searchable measurement reflects
+        # the same insert path (row vs batch) as the rest of the run. Vector
+        # count is still 1, so insert_mode=batch here exercises the batch path
+        # at minimum payload — not a "true" batch (N>1). For true batch behavior
+        # see multi_capture scenarios (T13–T14).
+        use_row = self.insert_mode == "single"
         with _Timer() as t_insert:
             self._ev_client.insert(
                 index_name=self._index_name,
                 vectors=[vec],
                 metadata=metadata,
+                use_row_insert=use_row,
                 await_searchable=True,
             )
         insert_searchable_ms = t_insert.elapsed_ms
