@@ -241,6 +241,7 @@ class LatencyBenchmark:
         self._embedding: Any = None
         self._ev_client: Any = None
         self._vault: Any = None
+        self._agent_dek: Optional[bytes] = None
 
     # ── setup ─────────────────────────────────────────────────────────────────
 
@@ -294,6 +295,7 @@ class LatencyBenchmark:
         self._index_name = index_name
         self._key_id = key_id
         self._vault = vault
+        self._agent_dek = agent_dek
 
         self._embedding = EmbeddingService(
             mode=cfg.embedding.mode,
@@ -640,6 +642,14 @@ class LatencyBenchmark:
                                queryable" wait.
           total              — wall clock including all phases
 
+        After `wait_searchable`, runs a recall verification step OUTSIDE the
+        measured latency window: re-runs the recall pipeline with the same
+        vector and checks that the just-inserted record's unique id appears
+        in top-10 results. If verification fails (e.g. publication did not
+        actually expose the record), raises RuntimeError so the caller marks
+        the scenario as FAIL — we want the "true SEARCHABLE" claim to be
+        validated, not just trusted from `done=true`.
+
         Requires pyenvector 1.4.x in the venv. Will TypeError on 1.2.2
         (older `Index.insert` signature has only `data`/`metadata`).
         """
@@ -663,7 +673,9 @@ class LatencyBenchmark:
                 await self._vault.decrypt_search_results(blobs[0], top_k=3)
             vault_ms = t_vault.elapsed_ms
 
-        metadata = [self._build_insert_metadata(text, title, domain)]
+        insert_metadata = self._build_insert_metadata(text, title, domain)
+        expected_id = insert_metadata["id"]
+        metadata = [insert_metadata]
         use_row = self.insert_mode == "single"
         request_ids: list[str] = []
 
@@ -707,6 +719,14 @@ class LatencyBenchmark:
         wait_searchable_ms = t_wait.elapsed_ms
 
         total_ms = (time.perf_counter() - total_start) * 1000.0
+
+        # Recall verification — outside the measured latency window.
+        # Re-runs the recall pipeline with the same vector and matches the
+        # captured unique id against the decrypted metadata `id` field. If the
+        # id is not found in top-10, raise — caller turns this into a scenario
+        # FAIL via the existing try/except in run_searchable_scenario.
+        await self._verify_searchable_recall(vec, expected_id)
+
         return {
             "embed": embed_ms,
             "score": score_ms,
@@ -716,6 +736,92 @@ class LatencyBenchmark:
             "wait_searchable": wait_searchable_ms,
             "total": total_ms,
         }
+
+    async def _verify_searchable_recall(
+        self,
+        vec: list,
+        expected_id: str,
+        top_k: int = 10,
+    ) -> None:
+        """Verify that the record we just inserted is actually recallable.
+
+        Re-runs score → vault decrypt → remind with the same vector, then
+        decrypts each result's app-layer-encrypted metadata locally with the
+        per-agent DEK and checks whether `expected_id` appears among the
+        top-`top_k` ids. Raises RuntimeError on any failure (missing DEK,
+        empty results, decrypt failure, or id not found) so the caller treats
+        the scenario as FAIL.
+        """
+        from pyenvector.utils.aes import decrypt_metadata as aes_decrypt
+
+        if self._agent_dek is None:
+            raise RuntimeError(
+                "recall verification: agent_dek missing — cannot decrypt metadata"
+            )
+
+        score_res = self._ev_client.score(self._index_name, vec)
+        if not score_res.get("ok"):
+            raise RuntimeError(
+                f"recall verification: score failed: {score_res.get('error')}"
+            )
+        blobs = score_res.get("encrypted_blobs", [])
+        if not blobs:
+            raise RuntimeError("recall verification: score returned no blobs")
+
+        vault_res = await self._vault.decrypt_search_results(blobs[0], top_k=top_k)
+        if not vault_res.ok or not vault_res.results:
+            raise RuntimeError(
+                f"recall verification: vault decrypt returned no results (ok={vault_res.ok})"
+            )
+
+        remind_res = self._ev_client.remind(
+            self._index_name,
+            vault_res.results,
+            output_fields=["metadata"],
+        )
+        if not remind_res.get("ok"):
+            raise RuntimeError(
+                f"recall verification: remind failed: {remind_res.get('error')}"
+            )
+
+        found_ids: list[str] = []
+        for entry in remind_res.get("results", []):
+            meta_field = entry.get("metadata") or entry.get("data")
+            if not isinstance(meta_field, str):
+                continue
+            try:
+                wrapper = json.loads(meta_field)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(wrapper, dict):
+                continue
+            ct = wrapper.get("c")
+            if not isinstance(ct, str):
+                continue
+            try:
+                decrypted = aes_decrypt(ct, self._agent_dek)
+            except Exception:
+                continue
+            if isinstance(decrypted, (bytes, bytearray)):
+                try:
+                    decrypted = json.loads(bytes(decrypted).decode())
+                except Exception:
+                    continue
+            elif isinstance(decrypted, str):
+                try:
+                    decrypted = json.loads(decrypted)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+            if isinstance(decrypted, dict):
+                mid = decrypted.get("id")
+                if isinstance(mid, str):
+                    found_ids.append(mid)
+
+        if expected_id not in found_ids:
+            raise RuntimeError(
+                f"recall verification: expected id '{expected_id}' not found in "
+                f"top-{top_k} results (got {len(found_ids)} decryptable ids)"
+            )
 
     async def run_searchable_scenario(self, scenario: dict) -> LatencyScenarioResult:
         """T10-T12: measure capture → searchable latency.
