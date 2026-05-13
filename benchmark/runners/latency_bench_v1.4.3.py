@@ -29,12 +29,19 @@ Scenarios (all target ivf_vct index, eval_mode=mm32)
     T13 2-phase batch embed+insert
     T14 5-phase batch embed+insert
   searchable:
-    (3-phase decomposition of "capture → true SEARCHABLE (`done=true`)":
-       insert_rpc      — Index.insert(await_completion=False, load=False,
-                         request_ids=[]) — split/persist submission only
-       load_index      — Index.load() — explicit LoadIndex RPC (publication)
-       wait_searchable — Index.wait_for_inserts_searchable(request_ids) —
-                         poll until done=true (true SEARCHABLE=7 in proto)
+    (3-phase decomposition of "capture → true SEARCHABLE (`done=true`)",
+     aligned with the SDK 1.4.3 + cluster lifecycle (raw → merged → published):
+       insert_rpc   — Index.insert(execute_until="segmentation",
+                      await_completion=False, load=False) — split submission
+                      only, returns as soon as data lands as raw shards.
+       merge_wait   — Indexer.wait_for_insert_persist_completed(request_ids):
+                      poll until raw shards are merged (MERGED_SAVED=6).
+       publish_wait — Index.load() (now safe — merged shards exist) +
+                      Indexer.wait_for_inserts_searchable(request_ids): poll
+                      until done=true (true SEARCHABLE=7 in proto).
+     `Index.load()` is also called once before measurement starts to ensure
+     the index is loaded — calling it after insert while raw shards still
+     exist triggers ForwardLoadRawShard which the cluster does not support.
      Bypasses the rune wrapper's `await_searchable` alias which only reaches
      MERGED_SAVED=6, not the true SEARCHABLE=7. Requires pyenvector 1.4.x.)
     T10 Short English
@@ -627,22 +634,36 @@ class LatencyBenchmark:
           embed              — embed locally
           score              — FHE novelty check
           vault_topk         — Vault decrypt
-          insert_rpc         — Index.insert(await_completion=False, load=False,
+          insert_rpc         — Index.insert(execute_until="segmentation",
+                               await_completion=False, load=False,
                                use_row_insert=<mode>, request_ids=[]):
-                               split/persist submission only, no SDK-side wait.
-                               The `request_ids` out-list is filled with the
-                               server-generated split request IDs that Phase C
-                               polls.
-          load_index         — Index.load(): explicit publication (LoadIndex
-                               RPC). No-op if already loaded with no pending
-                               shards.
-          wait_searchable    — Index.wait_for_inserts_searchable(request_ids):
-                               poll until `done=true` for the captured request
-                               IDs. This is the actual "capture → recall
-                               queryable" wait.
+                               split submission only. Returns as soon as data
+                               lands as raw shards on the server. The
+                               `request_ids` out-list is filled with the
+                               server-generated request IDs that Phases B and C
+                               poll against.
+          merge_wait         — Indexer.wait_for_index_operations_state(
+                               request_ids, target_state=MERGED_SAVED): polls
+                               until raw shards have been merged (state=6).
+                               Note: the SDK's named helpers are misleading —
+                               `wait_for_insert_persist_completed` only goes
+                               to SPLIT_COMPLETED (=5) and
+                               `wait_for_inserts_searchable` only goes to
+                               MERGED_SAVED (=6) despite its name. We call the
+                               state-poll directly with the explicit target.
+          publish_wait       — Index.load() + Indexer.wait_for_index_operations_state(
+                               request_ids, target_state=SEARCHABLE): explicit
+                               publication of the now-merged shards, then poll
+                               until done=true (SEARCHABLE=7). `load()` MUST
+                               happen after merge — calling it earlier (while
+                               raw shards still exist) triggers
+                               ForwardLoadRawShard, which the cluster does not
+                               support. The index is also pre-loaded once
+                               before measurement starts (setup) for the same
+                               reason.
           total              — wall clock including all phases
 
-        After `wait_searchable`, runs a recall verification step OUTSIDE the
+        After `publish_wait`, runs a recall verification step OUTSIDE the
         measured latency window: re-runs the recall pipeline with the same
         vector and checks that the just-inserted record's unique id appears
         in top-10 results. If verification fails (e.g. publication did not
@@ -654,6 +675,42 @@ class LatencyBenchmark:
         (older `Index.insert` signature has only `data`/`metadata`).
         """
         import pyenvector as ev
+        from pyenvector.proto_gen.v2.common.index_operation_message_pb2 import (
+            IndexOperationState,
+        )
+
+        # `wait_for_inserts_searchable` is misnamed: it polls until MERGED_SAVED
+        # (=6), not SEARCHABLE (=7). Use `wait_for_index_operations_state` with
+        # explicit target_state to reach each phase boundary precisely.
+        merged_state = IndexOperationState.Value("MERGED_SAVED")    # = 6
+        searchable_state = IndexOperationState.Value("SEARCHABLE")  # = 7
+
+        # Setup (outside measurement): ensure the index is loaded BEFORE we
+        # insert. The cluster does not support ForwardLoadRawShard, so calling
+        # Index.load() while raw shards are still pending (which is exactly
+        # the state Phase A leaves the server in) crashes. Pre-loading here
+        # is idempotent — the SDK treats "already loaded with no pending
+        # shards" as a no-op.
+        #
+        # `_ensure_initialized()` itself has no retry; the first connect after
+        # process start can flake on this cluster. Retry up to 5x so a cold
+        # start doesn't fail the entire scenario before warmup runs.
+        last_err = None
+        for _attempt in range(5):
+            try:
+                self._ev_client._ensure_initialized()
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(2.0)
+        if last_err is not None:
+            raise last_err
+        adapter = self._ev_client._adapter
+        def _ensure_index_loaded():
+            idx = ev.Index(self._index_name)
+            idx.load()
+        adapter._with_reconnect(_ensure_index_loaded)
 
         reusable_insight = text[:120]
         total_start = time.perf_counter()
@@ -675,48 +732,73 @@ class LatencyBenchmark:
 
         insert_metadata = self._build_insert_metadata(text, title, domain)
         expected_id = insert_metadata["id"]
-        metadata = [insert_metadata]
         use_row = self.insert_mode == "single"
         request_ids: list[str] = []
 
-        # SDK 1.4.3 fine-grained API — bypass the rune wrapper's
-        # `await_searchable` alias to measure each lifecycle phase separately.
-        # `_ensure_initialized()` makes sure self._ev_client._adapter is built;
-        # the prior `.score()` call above already triggers this lazily, but we
-        # call it explicitly for clarity.
-        self._ev_client._ensure_initialized()
-        adapter = self._ev_client._adapter
+        # The row-insert API path validates metadata as strings (server rejects
+        # raw dicts with `async split data failed`). Mirror what
+        # `invoke_insert` does: JSON-stringify, then app-encrypt with the
+        # per-agent DEK if available. The batch path also accepts this format.
+        metadata_str = [json.dumps(insert_metadata)]
+        if adapter._agent_dek and adapter._agent_id:
+            metadata_wire = [adapter._app_encrypt_metadata(m) for m in metadata_str]
+        else:
+            metadata_wire = metadata_str
 
-        # [4] Phase A — insert RPC only (no wait, no auto-load)
+        # [4] Phase A — insert RPC only. Data lands as raw shards on the server
+        # and the call returns; merge/publication happen later in Phases B/C.
         with _Timer() as t_insert_rpc:
             def _do_insert():
                 idx = ev.Index(self._index_name)
                 idx.insert(
                     data=[vec],
-                    metadata=metadata,
+                    metadata=metadata_wire,
                     await_completion=False,
                     load=False,
                     use_row_insert=use_row,
+                    execute_until="segmentation",
                     request_ids=request_ids,
                 )
             adapter._with_reconnect(_do_insert)
         insert_rpc_ms = t_insert_rpc.elapsed_ms
 
-        # [5] Phase B — explicit publication (LoadIndex RPC)
-        with _Timer() as t_load:
-            def _do_load():
+        # [5] Phase B — raw → merged: poll get_index_operation_status until
+        # each request_id reaches MERGED_SAVED (=6). The SDK's named helpers
+        # are misleading — `wait_for_insert_persist_completed` only goes to
+        # SPLIT_COMPLETED, and `wait_for_inserts_searchable` only goes to
+        # MERGED_SAVED despite the name. We call the underlying state-poll
+        # directly with the explicit target.
+        with _Timer() as t_merge:
+            def _do_merge_wait():
+                idx = ev.Index(self._index_name)
+                idx.indexer.wait_for_index_operations_state(
+                    self._index_name,
+                    request_ids,
+                    target_state=merged_state,
+                    timeout_s=120.0,
+                    poll_interval_s=0.5,
+                )
+            adapter._with_reconnect(_do_merge_wait)
+        merge_wait_ms = t_merge.elapsed_ms
+
+        # [6] Phase C — merged → SEARCHABLE: publish then wait for done=true.
+        # `Index.load()` is safe here because the shards are now merged
+        # (ForwardLoadRawShard is only triggered when raw shards exist).
+        # Poll get_index_operation_status until each request_id reaches
+        # SEARCHABLE (=7, i.e. `done=true`).
+        with _Timer() as t_publish:
+            def _do_publish():
                 idx = ev.Index(self._index_name)
                 idx.load()
-            adapter._with_reconnect(_do_load)
-        load_index_ms = t_load.elapsed_ms
-
-        # [6] Phase C — wait until truly searchable (done=true)
-        with _Timer() as t_wait:
-            def _do_wait():
-                idx = ev.Index(self._index_name)
-                idx.wait_for_inserts_searchable(request_ids)
-            adapter._with_reconnect(_do_wait)
-        wait_searchable_ms = t_wait.elapsed_ms
+                idx.indexer.wait_for_index_operations_state(
+                    self._index_name,
+                    request_ids,
+                    target_state=searchable_state,
+                    timeout_s=120.0,
+                    poll_interval_s=0.5,
+                )
+            adapter._with_reconnect(_do_publish)
+        publish_wait_ms = t_publish.elapsed_ms
 
         total_ms = (time.perf_counter() - total_start) * 1000.0
 
@@ -732,8 +814,8 @@ class LatencyBenchmark:
             "score": score_ms,
             "vault_topk": vault_ms,
             "insert_rpc": insert_rpc_ms,
-            "load_index": load_index_ms,
-            "wait_searchable": wait_searchable_ms,
+            "merge_wait": merge_wait_ms,
+            "publish_wait": publish_wait_ms,
             "total": total_ms,
         }
 
@@ -826,8 +908,8 @@ class LatencyBenchmark:
     async def run_searchable_scenario(self, scenario: dict) -> LatencyScenarioResult:
         """T10-T12: measure capture → searchable latency.
 
-        Total wall-clock = embed + score + vault_topk + insert_rpc + load_index
-        + wait_searchable. The last three phases drive the SDK 1.4.3 lifecycle
+        Total wall-clock = embed + score + vault_topk + insert_rpc + merge_wait
+        + publish_wait. The last three phases drive the SDK 1.4.3 lifecycle
         directly to reach the true `SEARCHABLE` (`done=true`) state; see
         `_searchable_capture_phases` docstring for the rationale (bypassing the
         rune wrapper's `await_searchable` alias which only reaches `MERGED_SAVED`).
@@ -864,8 +946,8 @@ class LatencyBenchmark:
                 "score",
                 "vault_topk",
                 "insert_rpc",
-                "load_index",
-                "wait_searchable",
+                "merge_wait",
+                "publish_wait",
                 "total",
             ],
             all_timings,
