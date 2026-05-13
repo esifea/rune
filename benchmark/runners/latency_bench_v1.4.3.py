@@ -29,11 +29,14 @@ Scenarios (all target ivf_vct index, eval_mode=mm32)
     T13 2-phase batch embed+insert
     T14 5-phase batch embed+insert
   searchable:
-    (server-push wait target — `MERGED_SAVED` (=6 in proto): the insert
-     request's vectors have all moved from temporary raw shards into
-     canonical non-raw shards, but have not yet been published via
-     LoadIndex. `SEARCHABLE`=7 is a separate enum. See
-     envector-msa-1.4.3/proto/v2/common/index-operation-message.proto.)
+    (3-phase decomposition of "capture → true SEARCHABLE (`done=true`)":
+       insert_rpc      — Index.insert(await_completion=False, load=False,
+                         request_ids=[]) — split/persist submission only
+       load_index      — Index.load() — explicit LoadIndex RPC (publication)
+       wait_searchable — Index.wait_for_inserts_searchable(request_ids) —
+                         poll until done=true (true SEARCHABLE=7 in proto)
+     Bypasses the rune wrapper's `await_searchable` alias which only reaches
+     MERGED_SAVED=6, not the true SEARCHABLE=7. Requires pyenvector 1.4.x.)
     T10 Short English
     T11 Long English
     T12 Korean
@@ -608,29 +611,40 @@ class LatencyBenchmark:
         self, text: str, title: str, domain: str
     ) -> dict[str, float]:
         """
-        Measure time from capture start until the server reaches the internal
-        state `MERGED_SAVED` — defined as: the insert request's vectors have
-        all moved from temporary raw shards into canonical non-raw shards, but
-        have not yet been published via LoadIndex (proto enum value 6 in
-        envector-msa-1.4.3/proto/v2/common/index-operation-message.proto;
-        `SEARCHABLE`=7 is a separate enum).
+        Measure time from capture start until data is truly searchable
+        (`done=true`) — 3-phase decomposition per SDK 1.4.3 lifecycle.
+
+        Why we bypass the rune wrapper here:
+          The rune wrapper's `await_searchable=True` maps to SDK
+          `await_completion=True` + `execute_until="segmentation"`, which only
+          reaches `MERGED_SAVED` (all items in non-raw shards but not yet
+          published). To measure the true `SEARCHABLE` (`done=true`) latency,
+          we drive the SDK `Index` directly through three explicit phases.
 
         Phases:
           embed              — embed locally
           score              — FHE novelty check
           vault_topk         — Vault decrypt
-          insert_searchable  — insert(use_row_insert=<mode>, await_searchable=True):
-                               RPC submission + server wait until `MERGED_SAVED`.
-                               `use_row_insert` follows the CLI --insert-mode
-                               (single → True, batch → False), so the single
-                               and batch reports exercise different insert
-                               server paths under searchable wait.
+          insert_rpc         — Index.insert(await_completion=False, load=False,
+                               use_row_insert=<mode>, request_ids=[]):
+                               split/persist submission only, no SDK-side wait.
+                               The `request_ids` out-list is filled with the
+                               server-generated split request IDs that Phase C
+                               polls.
+          load_index         — Index.load(): explicit publication (LoadIndex
+                               RPC). No-op if already loaded with no pending
+                               shards.
+          wait_searchable    — Index.wait_for_inserts_searchable(request_ids):
+                               poll until `done=true` for the captured request
+                               IDs. This is the actual "capture → recall
+                               queryable" wait.
           total              — wall clock including all phases
 
-        Note: EnVectorClient.insert() does not return a request_id, so RPC
-        submission time and server-side wait cannot be measured separately.
-        Use benchmark/runners/insert_row_only.py for fine-grained decomposition.
+        Requires pyenvector 1.4.x in the venv. Will TypeError on 1.2.2
+        (older `Index.insert` signature has only `data`/`metadata`).
         """
+        import pyenvector as ev
+
         reusable_insight = text[:120]
         total_start = time.perf_counter()
 
@@ -650,37 +664,67 @@ class LatencyBenchmark:
             vault_ms = t_vault.elapsed_ms
 
         metadata = [self._build_insert_metadata(text, title, domain)]
-
-        # Honor the CLI --insert-mode so that searchable measurement reflects
-        # the same insert path (row vs batch) as the rest of the run. Vector
-        # count is still 1, so insert_mode=batch here exercises the batch path
-        # at minimum payload — not a "true" batch (N>1). For true batch behavior
-        # see multi_capture scenarios (T13–T14).
         use_row = self.insert_mode == "single"
-        with _Timer() as t_insert:
-            self._ev_client.insert(
-                index_name=self._index_name,
-                vectors=[vec],
-                metadata=metadata,
-                use_row_insert=use_row,
-                await_searchable=True,
-            )
-        insert_searchable_ms = t_insert.elapsed_ms
+        request_ids: list[str] = []
+
+        # SDK 1.4.3 fine-grained API — bypass the rune wrapper's
+        # `await_searchable` alias to measure each lifecycle phase separately.
+        # `_ensure_initialized()` makes sure self._ev_client._adapter is built;
+        # the prior `.score()` call above already triggers this lazily, but we
+        # call it explicitly for clarity.
+        self._ev_client._ensure_initialized()
+        adapter = self._ev_client._adapter
+
+        # [4] Phase A — insert RPC only (no wait, no auto-load)
+        with _Timer() as t_insert_rpc:
+            def _do_insert():
+                idx = ev.Index(self._index_name)
+                idx.insert(
+                    data=[vec],
+                    metadata=metadata,
+                    await_completion=False,
+                    load=False,
+                    use_row_insert=use_row,
+                    request_ids=request_ids,
+                )
+            adapter._with_reconnect(_do_insert)
+        insert_rpc_ms = t_insert_rpc.elapsed_ms
+
+        # [5] Phase B — explicit publication (LoadIndex RPC)
+        with _Timer() as t_load:
+            def _do_load():
+                idx = ev.Index(self._index_name)
+                idx.load()
+            adapter._with_reconnect(_do_load)
+        load_index_ms = t_load.elapsed_ms
+
+        # [6] Phase C — wait until truly searchable (done=true)
+        with _Timer() as t_wait:
+            def _do_wait():
+                idx = ev.Index(self._index_name)
+                idx.wait_for_inserts_searchable(request_ids)
+            adapter._with_reconnect(_do_wait)
+        wait_searchable_ms = t_wait.elapsed_ms
 
         total_ms = (time.perf_counter() - total_start) * 1000.0
         return {
             "embed": embed_ms,
             "score": score_ms,
             "vault_topk": vault_ms,
-            "insert_searchable": insert_searchable_ms,
+            "insert_rpc": insert_rpc_ms,
+            "load_index": load_index_ms,
+            "wait_searchable": wait_searchable_ms,
             "total": total_ms,
         }
 
     async def run_searchable_scenario(self, scenario: dict) -> LatencyScenarioResult:
         """T10-T12: measure capture → searchable latency.
 
-        Wall-clock = insert RPC submission + server wait until `MERGED_SAVED`
-        (raw→non-raw shard transition complete, pre-publish).
+        Total wall-clock = embed + score + vault_topk + insert_rpc + load_index
+        + wait_searchable. The last three phases drive the SDK 1.4.3 lifecycle
+        directly to reach the true `SEARCHABLE` (`done=true`) state; see
+        `_searchable_capture_phases` docstring for the rationale (bypassing the
+        rune wrapper's `await_searchable` alias which only reaches `MERGED_SAVED`).
         """
         _parts = scenario["id"].split("_", 1)
         sid = f"T{int(_parts[0][1:]) + 9}_{_parts[1]}_searchable"
@@ -709,7 +753,15 @@ class LatencyBenchmark:
 
         print("done")
         phases = self._build_phase_list(
-            ["embed", "score", "vault_topk", "insert_searchable", "total"],
+            [
+                "embed",
+                "score",
+                "vault_topk",
+                "insert_rpc",
+                "load_index",
+                "wait_searchable",
+                "total",
+            ],
             all_timings,
         )
         return LatencyScenarioResult(
