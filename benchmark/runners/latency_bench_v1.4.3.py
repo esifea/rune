@@ -597,7 +597,71 @@ class LatencyBenchmark:
             f"score() to recover. Last error: {last_err}"
         )
 
+    def _prime_bench_index(self, n_records: int = 20) -> None:
+        """Insert deterministic records so recall scenarios have data to score.
+
+        Recall scenarios in --direct-envector mode run on the empty index
+        produced by reset without calling this.
+
+        Uses await_completion=True + load=False to leave the index in a
+        stable searchable state when measurement begins; no merge-wait
+        needed afterwards.
+        """
+        if not self.direct_envector:
+            return
+
+        import pyenvector as ev
+
+        rng = np.random.default_rng(0xBEEF)
+        adapter = self._ev_client._adapter
+
+        print(
+            f"  priming {self._index_name} with {n_records} records...",
+            end=" ", flush=True,
+        )
+        start = time.monotonic()
+        for i in range(n_records):
+            vec = rng.standard_normal(BENCH_DIM).astype(np.float32).tolist()
+            meta_dict = self._build_insert_metadata(
+                f"priming record {i}",
+                f"prime-{i}",
+                "priming",
+            )
+            meta_str = json.dumps(meta_dict)
+            if adapter._agent_dek and adapter._agent_id:
+                meta_wire = adapter._app_encrypt_metadata(meta_str)
+            else:
+                meta_wire = meta_str
+
+            def _do_prime():
+                idx = ev.Index(self._index_name)
+                idx.insert(
+                    data=[vec],
+                    metadata=[meta_wire],
+                    await_completion=True,
+                    execute_until="segmentation",
+                    load=False,
+                    use_row_insert=True,
+                )
+
+            adapter._with_reconnect(_do_prime)
+        elapsed = time.monotonic() - start
+        print(f"done in {elapsed:.1f}s")
+
     async def teardown(self) -> None:
+        # Only running on `--direct-envector` mode so the production runecontext is never touched
+        if self.direct_envector and self._index_name and self._ev_client is not None:
+            try:
+                import pyenvector as ev
+                adapter = self._ev_client._adapter
+                target = self._index_name
+                def _do_drop():
+                    ev.drop_index(target)
+                adapter._with_reconnect(_do_drop)
+                print(f"  teardown: drop_index({target!r}) queued")
+            except Exception as e:
+                print(f"  teardown: drop_index failed (non-fatal): {e}")
+
         if self._vault is not None:
             await self._vault.close()
 
@@ -1431,9 +1495,11 @@ class LatencyBenchmark:
             print("\n[recall]")
             for sc in SCENARIOS_RECALL:
                 _reset_for(sc["id"])
+                self._prime_bench_index()
                 r = await self.run_recall_scenario(sc)
                 report.add(r)
             _reset_for("T7_topk_scaling")
+            self._prime_bench_index()
             for r in await self.run_recall_topk_scaling():
                 report.add(r)
 
