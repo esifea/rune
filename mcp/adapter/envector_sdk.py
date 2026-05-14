@@ -300,6 +300,10 @@ class EnVectorSDKAdapter:
                 metadata=metadata,
                 await_completion=await_searchable,
                 execute_until="segmentation",
+                # When `await_completion=False`, self.load() triggers
+                # ForwardLoadRawShard which v1.4.3 does not support if `load=True`.
+                # The caller is responsible for ensuring index is loaded
+                load=False,
                 use_row_insert=use_row_insert,
             )
 
