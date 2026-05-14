@@ -33,20 +33,45 @@ Scenarios (all target ivf_vct index, eval_mode=mm32)
      aligned with the SDK 1.4.3 + cluster lifecycle (raw → merged → published):
        insert_rpc   — Index.insert(execute_until="segmentation",
                       await_completion=False, load=False) — split submission
-                      only, returns as soon as data lands as raw shards.
-       merge_wait   — Indexer.wait_for_insert_persist_completed(request_ids):
-                      poll until raw shards are merged (MERGED_SAVED=6).
+                      plus auto-queued async_merge_by_request_ids, returns
+                      as soon as data lands as raw shards.
+       merge_wait   — Indexer.wait_for_index_operations_state(
+                      request_ids, target_state=MERGED_SAVED=6): poll until
+                      raw shards are merged.
        publish_wait — Index.load() (now safe — merged shards exist) +
-                      Indexer.wait_for_inserts_searchable(request_ids): poll
-                      until done=true (true SEARCHABLE=7 in proto).
+                      Indexer.wait_for_index_operations_state(
+                      request_ids, target_state=SEARCHABLE=7): poll until
+                      done=true (true SEARCHABLE=7 in proto).
      `Index.load()` is also called once before measurement starts to ensure
      the index is loaded — calling it after insert while raw shards still
      exist triggers ForwardLoadRawShard which the cluster does not support.
-     Bypasses the rune wrapper's `await_searchable` alias which only reaches
-     MERGED_SAVED=6, not the true SEARCHABLE=7. Requires pyenvector 1.4.x.)
+     SDK's SEARCHABLE wait short-circuits as soon as the server reports `done=true`
+     regardless of the reported state. Requires pyenvector 1.4.x.)
     T10 Short English
     T11 Long English
     T12 Korean
+
+Modes
+-----
+  default (production index)
+      Delegate to Rune-Vault for keys/credentials and run against the live
+      runecontext index. No reset is performed.
+
+  --direct-envector (benchmark index)
+      Vault is still used for keys, score decryption, and metadata DEK.
+      This flag will:
+        * override the bundle's `index_name` with a dedicated bench index
+          (default `runecontext_bench`) so the bench can never touch the
+          live data
+        * provision that bench index with the same params as production
+          (IVF_VCT, nlist=256, default_nprobe=6, dim=1024, mm32, plain
+          query encryption, no metadata encryption)
+        * drop + recreate that bench index between scenarios so each
+          scenario's latency numbers start on a clean status
+        * use `auto_key_setup=False` to avoid the SDK's
+          trying to unload `vault-key` while the live runecontext
+          index still references it
+        * reuse `vault-key` (same key the production index uses)
 
 Usage
 -----
@@ -54,6 +79,11 @@ Usage
   python benchmark/runners/latency_bench_v1.4.3.py --insert-mode batch
   python benchmark/runners/latency_bench_v1.4.3.py \\
       --insert-mode single --feature capture --runs 5
+
+  # Bench-index mode with per-scenario reset:
+  python benchmark/runners/latency_bench_v1.4.3.py \\
+      --insert-mode single --direct-envector --feature searchable --runs 7
+
   python benchmark/runners/latency_bench_v1.4.3.py \\
       --insert-mode single --runs 10 --warmup 2 \\
       --report benchmark/reports/latency_results_v1.4.3_ivfvct_single_2026-05-11.md
@@ -94,6 +124,10 @@ from runners.common import (  # noqa: E402
 
 EVAL_MODE = "mm32"
 INDEX_TYPE = "ivf_vct"
+
+# Direct-envector bench-index params used only when --direct-envector is set
+BENCH_DIM = 1024
+BENCH_INDEX_PARAMS = {"index_type": "IVF_VCT", "nlist": 256, "default_nprobe": 6}
 
 # ── sample inputs ─────────────────────────────────────────────────────────────
 
@@ -238,10 +272,19 @@ class LatencyBenchmark:
       "batch"  — index.insert(data=[v1,...,vN]) called once per batch
     """
 
-    def __init__(self, runs: int = 10, warmup: int = 2, insert_mode: str = "single") -> None:
+    def __init__(
+        self,
+        runs: int = 10,
+        warmup: int = 2,
+        insert_mode: str = "single",
+        direct_envector: bool = False,
+        bench_index_name: str = "runecontext_bench",
+    ) -> None:
         self.runs = runs
         self.warmup = warmup
         self.insert_mode = insert_mode
+        self.direct_envector = direct_envector
+        self.bench_index_name = bench_index_name
         self._config: Any = None
         self._index_name: Optional[str] = None
         self._key_id: Optional[str] = None
@@ -254,12 +297,21 @@ class LatencyBenchmark:
 
     async def setup(self) -> None:
         from agents.common.config import load_config
+
+        cfg = load_config()
+        self._config = cfg
+
+        if self.direct_envector:
+            await self._setup_direct_envector()
+        else:
+            await self._setup_vault()
+
+    async def _setup_vault(self) -> None:
         from agents.common.embedding_service import EmbeddingService
         from agents.common.envector_client import EnVectorClient
         from adapter.vault_client import VaultClient
 
-        cfg = load_config()
-        self._config = cfg
+        cfg = self._config
 
         print("  Connecting to Vault …", end=" ", flush=True)
         vault = VaultClient(
@@ -330,11 +382,146 @@ class LatencyBenchmark:
         print(f"    index_type : {INDEX_TYPE}")
         print(f"    insert_mode: {self.insert_mode}")
 
+    async def _setup_direct_envector(self) -> None:
+        """Benchmark index mode
+
+        Connects to Vault the same way the production path does: to pick up
+        `vault-key`, `agent_dek`, and the envector credentials
+        But create dedicated benchmark-only index that can be dropped and recreated
+        between scenarios without touching the live runecontext data.
+
+        We keep using Vault for FHE score decryption (the SecKey lives on Vault.
+        """
+        from agents.common.embedding_service import EmbeddingService
+        from agents.common.envector_client import EnVectorClient
+        from adapter.vault_client import VaultClient
+
+        cfg = self._config
+
+        print("  Connecting to Vault (for benchmark index mode)...", end=" ", flush=True)
+        vault = VaultClient(
+            vault_endpoint=cfg.vault.endpoint,
+            vault_token=cfg.vault.token,
+            ca_cert=cfg.vault.ca_cert or None,
+            tls_disable=cfg.vault.tls_disable,
+        )
+        bundle = await vault.get_public_key()
+
+        key_id = bundle.pop("key_id", None)
+        bundle.pop("index_name", None)
+        agent_id = bundle.pop("agent_id", None)
+        agent_dek_b64 = bundle.pop("agent_dek", None)
+        ev_endpoint = bundle.pop("envector_endpoint", None) or cfg.envector.endpoint
+        ev_api_key = bundle.pop("envector_api_key", None) or cfg.envector.api_key
+        ev_secure = bundle.pop("envector_secure", None)
+        if ev_secure is None:
+            ev_secure = cfg.envector.secure
+
+        if not key_id:
+            raise RuntimeError("Vault did not return key_id")
+
+        key_path = Path.home() / ".rune" / "keys"
+        key_dir = key_path / key_id
+        key_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for filename, content in bundle.items():
+            fp = key_dir / filename
+            fd = os.open(str(fp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+
+        agent_dek: Optional[bytes] = None
+        if agent_dek_b64:
+            agent_dek = base64.b64decode(agent_dek_b64)
+
+        self._index_name = self.bench_index_name
+        self._key_id = key_id
+        self._vault = vault
+        self._agent_dek = agent_dek
+
+        self._embedding = EmbeddingService(
+            mode=cfg.embedding.mode,
+            model=cfg.embedding.model,
+        )
+
+        # auto_key_setup=False so ev.init() doesn't trip the unload-others
+        # We must not try to unload existing vault-key
+        self._ev_client = EnVectorClient(
+            address=ev_endpoint,
+            key_path=str(key_path),
+            key_id=key_id,
+            access_token=ev_api_key,
+            secure=ev_secure,
+            auto_key_setup=False,
+            agent_id=agent_id,
+            agent_dek=agent_dek,
+            eval_mode=EVAL_MODE,
+            index_type=INDEX_TYPE,
+        )
+
+        last_err = None
+        for _attempt in range(5):
+            try:
+                self._ev_client._ensure_initialized()
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(2.0)
+        if last_err is not None:
+            raise last_err
+
+        # Clean start
+        self._reset_bench_index()
+
+        print("OK")
+        print(f"    index      : {self._index_name}  (bench-only, separate from runecontext)")
+        print(f"    key_id     : {self._key_id}  (shared with production - read-only here)")
+        print(f"    endpoint   : {ev_endpoint}")
+        print(f"    eval_mode  : {EVAL_MODE}")
+        print(f"    index_type : {INDEX_TYPE}")
+        print(f"    insert_mode: {self.insert_mode}")
+        print(f"    reset      : per-scenario drop+create")
+
+    def _reset_bench_index(self) -> None:
+        if not self.direct_envector:
+            raise RuntimeError(
+                "_reset_bench_index is bench-index mode only - refusing to "
+                "drop the production index."
+            )
+        if self._index_name == "runecontext":
+            raise RuntimeError(
+                f"_reset_bench_index refusing to operate on production index "
+                f"name 'runecontext' - set --bench-index to something else."
+            )
+
+        import pyenvector as ev
+
+        adapter = self._ev_client._adapter
+
+        def _do_reset():
+            existing = ev.get_index_list()
+            existing_names: list[str] = []
+            if hasattr(existing, "indexes"):
+                existing_names = [idx.index_name for idx in existing.indexes]
+            elif isinstance(existing, (list, tuple)):
+                existing_names = [str(idx) for idx in existing]
+
+            if self._index_name in existing_names:
+                ev.drop_index(self._index_name)
+            ev.create_index(
+                index_name=self._index_name,
+                dim=BENCH_DIM,
+                index_params=BENCH_INDEX_PARAMS,
+                query_encryption="plain",
+                metadata_encryption=False,
+                metadata_key=b"",
+            )
+
+        adapter._with_reconnect(_do_reset)
+
     async def teardown(self) -> None:
         if self._vault is not None:
             await self._vault.close()
-
-    # ── helpers ───────────────────────────────────────────────────────────────
 
     def _warmup_label(self, run_i: int) -> str:
         return "warmup" if run_i < self.warmup else f"run {run_i - self.warmup + 1}"
@@ -644,19 +831,18 @@ class LatencyBenchmark:
                                poll against.
           merge_wait         — Indexer.wait_for_index_operations_state(
                                request_ids, target_state=MERGED_SAVED): polls
-                               until raw shards have been merged (state=6).
-                               Note: the SDK's named helpers are misleading —
-                               `wait_for_insert_persist_completed` only goes
-                               to SPLIT_COMPLETED (=5) and
-                               `wait_for_inserts_searchable` only goes to
-                               MERGED_SAVED (=6) despite its name. We call the
-                               state-poll directly with the explicit target.
+                               get_index_operation_status until each
+                               request_id reaches MERGED_SAVED (=6 in proto).
+                               This is the boundary where raw shards have
+                               been merged into IVF clusters.
           publish_wait       — Index.load() + Indexer.wait_for_index_operations_state(
                                request_ids, target_state=SEARCHABLE): explicit
                                publication of the now-merged shards, then poll
-                               until done=true (SEARCHABLE=7). `load()` MUST
-                               happen after merge — calling it earlier (while
-                               raw shards still exist) triggers
+                               until done=true (SEARCHABLE=7). The poll's
+                               stop condition is `last.done == True` when
+                               target_state == SEARCHABLE.
+                               `load()` MUST happen after merge — calling it
+                               earlier (while raw shards still exist) triggers
                                ForwardLoadRawShard, which the cluster does not
                                support. The index is also pre-loaded once
                                before measurement starts (setup) for the same
@@ -679,9 +865,6 @@ class LatencyBenchmark:
             IndexOperationState,
         )
 
-        # `wait_for_inserts_searchable` is misnamed: it polls until MERGED_SAVED
-        # (=6), not SEARCHABLE (=7). Use `wait_for_index_operations_state` with
-        # explicit target_state to reach each phase boundary precisely.
         merged_state = IndexOperationState.Value("MERGED_SAVED")    # = 6
         searchable_state = IndexOperationState.Value("SEARCHABLE")  # = 7
 
@@ -763,11 +946,11 @@ class LatencyBenchmark:
         insert_rpc_ms = t_insert_rpc.elapsed_ms
 
         # [5] Phase B — raw → merged: poll get_index_operation_status until
-        # each request_id reaches MERGED_SAVED (=6). The SDK's named helpers
-        # are misleading — `wait_for_insert_persist_completed` only goes to
-        # SPLIT_COMPLETED, and `wait_for_inserts_searchable` only goes to
-        # MERGED_SAVED despite the name. We call the underlying state-poll
-        # directly with the explicit target.
+        # each request_id reaches MERGED_SAVED (=6). Since target is not
+        # SEARCHABLE, the rank-based stop condition applies.
+        # Phase A already submitted async_merge_by_request_ids via
+        # `execute_until="segmentation"`, so the merge work is already in
+        # flight by the time we start polling.
         with _Timer() as t_merge:
             def _do_merge_wait():
                 idx = ev.Index(self._index_name)
@@ -782,10 +965,7 @@ class LatencyBenchmark:
         merge_wait_ms = t_merge.elapsed_ms
 
         # [6] Phase C — merged → SEARCHABLE: publish then wait for done=true.
-        # `Index.load()` is safe here because the shards are now merged
-        # (ForwardLoadRawShard is only triggered when raw shards exist).
-        # Poll get_index_operation_status until each request_id reaches
-        # SEARCHABLE (=7, i.e. `done=true`).
+        # Poll get_index_operation_status until each request_id reports `done=true`.
         with _Timer() as t_publish:
             def _do_publish():
                 idx = ev.Index(self._index_name)
@@ -1127,6 +1307,11 @@ class LatencyBenchmark:
             "network_rtt": rtt,
             "runs_per_scenario": self.runs - self.warmup,
             "warmup_runs": self.warmup,
+            "direct_envector": self.direct_envector,
+            "reset_policy": (
+                "per-scenario drop+create" if self.direct_envector
+                else "no reset (shared production index)"
+            ),
         }
 
         run_all = feature_filter is None
@@ -1136,19 +1321,31 @@ class LatencyBenchmark:
         run_searchable = run_all or feature_filter == "searchable"
         run_multi = run_all or feature_filter == "multi_capture"
 
+        # Only used with '--direct-envector' flag
+        def _reset_for(scenario_label: str) -> None:
+            if not self.direct_envector:
+                return
+            print(f"  reset[{scenario_label}]...", end=" ", flush=True)
+            self._reset_bench_index()
+            print("done")
+
         if run_capture:
             print("\n[capture]")
             for sc in SCENARIOS_CAPTURE:
+                _reset_for(sc["id"])
                 r = await self.run_capture_scenario(sc)
                 report.add(r)
+            _reset_for("T4_duplicate")
             r = await self.run_capture_duplicate()
             report.add(r)
 
         if run_recall:
             print("\n[recall]")
             for sc in SCENARIOS_RECALL:
+                _reset_for(sc["id"])
                 r = await self.run_recall_scenario(sc)
                 report.add(r)
+            _reset_for("T7_topk_scaling")
             for r in await self.run_recall_topk_scaling():
                 report.add(r)
 
@@ -1160,12 +1357,14 @@ class LatencyBenchmark:
         if run_searchable:
             print("\n[searchable]")
             for sc in SCENARIOS_CAPTURE[:3]:  # T1, T2, T3 — short/long/Korean
+                _reset_for(sc["id"] + "_searchable")
                 r = await self.run_searchable_scenario(sc)
                 report.add(r)
 
         if run_multi:
             print("\n[multi_capture]")
             for sc in SCENARIOS_MULTI_CAPTURE:
+                _reset_for(sc["id"])
                 r = await self.run_multi_capture_scenario(sc)
                 report.add(r)
 
@@ -1207,9 +1406,15 @@ async def _main(args: argparse.Namespace) -> None:
         runs=args.runs,
         warmup=args.warmup,
         insert_mode=args.insert_mode,
+        direct_envector=args.direct_envector,
+        bench_index_name=args.bench_index,
     )
 
-    print(f"\nSetting up … (eval_mode={EVAL_MODE}, index_type={INDEX_TYPE}, insert_mode={args.insert_mode})")
+    mode_label = "bench-index" if args.direct_envector else "vault-mediated"
+    print(
+        f"\nSetting up … (mode={mode_label}, eval_mode={EVAL_MODE}, "
+        f"index_type={INDEX_TYPE}, insert_mode={args.insert_mode})"
+    )
     await bench.setup()
 
     print(f"\nRunning benchmark (runs={args.runs - args.warmup} effective, warmup={args.warmup}) …")
@@ -1268,6 +1473,22 @@ def main() -> None:
         choices=["md", "json"],
         default="md",
         help="Report format (default: md)",
+    )
+    parser.add_argument(
+        "--direct-envector",
+        action="store_true",
+        help=(
+            "Benchmark index mode: use a dedicated bench index instead of the "
+            "live index, drop+recreate it between scenarios for clean "
+            "latency numbers. Vault is still used for keys and FHE score "
+            "decryption (the SecKey only lives on Vault). "
+            "Does NOT touch the live data."
+        ),
+    )
+    parser.add_argument(
+        "--bench-index",
+        default="runecontext_bench",
+        help="Bench index name (--direct-envector only, default: runecontext_bench)",
     )
     args = parser.parse_args()
 
