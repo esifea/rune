@@ -597,6 +597,35 @@ class LatencyBenchmark:
             f"score() to recover. Last error: {last_err}"
         )
 
+    async def _vault_decrypt_with_retry(
+        self,
+        encrypted_blob: str,
+        top_k: int,
+        max_attempts: int = 5,
+    ):
+        import re
+        last_err: Optional[Exception] = None
+        for attempt in range(max_attempts):
+            try:
+                return await self._vault.decrypt_search_results(
+                    encrypted_blob, top_k=top_k
+                )
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if "RESOURCE_EXHAUSTED" not in msg and "Rate limit" not in msg:
+                    raise
+                m = re.search(r"Retry after (\d+(?:\.\d+)?)\s*s", msg)
+                delay = float(m.group(1)) + 1.0 if m else 25.0
+                print(
+                    f"\n    Vault rate limit (attempt {attempt + 1}/{max_attempts}): "
+                    f"sleeping {delay:.1f}s",
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+        assert last_err is not None
+        raise last_err
+
     def _prime_bench_index(self, n_records: int = 20) -> None:
         """Insert deterministic records so recall scenarios have data to score.
 
@@ -722,7 +751,7 @@ class LatencyBenchmark:
         blobs = score_res.get("encrypted_blobs", []) if score_res.get("ok") else []
         if blobs:
             with _Timer() as t_vault:
-                await self._vault.decrypt_search_results(blobs[0], top_k=3)
+                await self._vault_decrypt_with_retry(blobs[0], top_k=3)
             vault_ms = t_vault.elapsed_ms
 
         # [4] Insert
@@ -778,7 +807,7 @@ class LatencyBenchmark:
         blobs = score_res.get("encrypted_blobs", []) if score_res.get("ok") else []
         if blobs:
             with _Timer() as t_vault:
-                vault_res = await self._vault.decrypt_search_results(blobs[0], top_k=topk)
+                vault_res = await self._vault_decrypt_with_retry(blobs[0], top_k=topk)
             vault_ms = t_vault.elapsed_ms
 
             if vault_res.ok and vault_res.results:
@@ -1057,7 +1086,7 @@ class LatencyBenchmark:
         blobs = score_res.get("encrypted_blobs", []) if score_res.get("ok") else []
         if blobs:
             with _Timer() as t_vault:
-                await self._vault.decrypt_search_results(blobs[0], top_k=3)
+                await self._vault_decrypt_with_retry(blobs[0], top_k=3)
             vault_ms = t_vault.elapsed_ms
 
         insert_metadata = self._build_insert_metadata(text, title, domain)
@@ -1177,7 +1206,7 @@ class LatencyBenchmark:
         if not blobs:
             raise RuntimeError("recall verification: score returned no blobs")
 
-        vault_res = await self._vault.decrypt_search_results(blobs[0], top_k=top_k)
+        vault_res = await self._vault_decrypt_with_retry(blobs[0], top_k=top_k)
         if not vault_res.ok or not vault_res.results:
             raise RuntimeError(
                 f"recall verification: vault decrypt returned no results (ok={vault_res.ok})"
@@ -1345,7 +1374,7 @@ class LatencyBenchmark:
         blobs = score_res.get("encrypted_blobs", []) if score_res.get("ok") else []
         if blobs:
             with _Timer() as t_vault:
-                await self._vault.decrypt_search_results(blobs[0], top_k=3)
+                await self._vault_decrypt_with_retry(blobs[0], top_k=3)
             vault_ms = t_vault.elapsed_ms
 
         # [4] Insert all N vectors as batch (use_row_insert=False)
