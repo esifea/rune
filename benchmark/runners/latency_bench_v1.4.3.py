@@ -498,26 +498,104 @@ class LatencyBenchmark:
 
         adapter = self._ev_client._adapter
 
-        def _do_reset():
+        def _list_index_names() -> list[str]:
             existing = ev.get_index_list()
-            existing_names: list[str] = []
             if hasattr(existing, "indexes"):
-                existing_names = [idx.index_name for idx in existing.indexes]
-            elif isinstance(existing, (list, tuple)):
-                existing_names = [str(idx) for idx in existing]
+                return [idx.index_name for idx in existing.indexes]
+            if isinstance(existing, (list, tuple)):
+                return [str(idx) for idx in existing]
+            return []
 
-            if self._index_name in existing_names:
+        def _do_reset():
+            if self._index_name in _list_index_names():
                 ev.drop_index(self._index_name)
-            ev.create_index(
-                index_name=self._index_name,
-                dim=BENCH_DIM,
-                index_params=BENCH_INDEX_PARAMS,
-                query_encryption="plain",
-                metadata_encryption=False,
-                metadata_key=b"",
+
+            # The cluster's drop is async and `get_index_list` keeps the
+            # name visible long after drop is accepted, so we cannot poll
+            # the listing for completion. Poll create_index instead: it
+            # succeeds the moment the drop fully retires
+            deadline = time.monotonic() + 180.0
+            saw_being_deleted = False
+            last_err: Optional[Exception] = None
+            while time.monotonic() < deadline:
+                try:
+                    ev.create_index(
+                        index_name=self._index_name,
+                        dim=BENCH_DIM,
+                        index_params=BENCH_INDEX_PARAMS,
+                        query_encryption="plain",
+                        metadata_encryption=False,
+                        metadata_key=b"",
+                    )
+                    return
+                except Exception as e:
+                    last_err = e
+                    msg = str(e).lower()
+                    if "being deleted" in msg or "notready" in msg:
+                        saw_being_deleted = True
+                        time.sleep(2.0)
+                        continue
+                    raise
+
+            if saw_being_deleted:
+                raise RuntimeError(
+                    f"_reset_bench_index: bench index {self._index_name!r} "
+                    f"is stuck in 'being deleted' state - drop_index returns "
+                    f"ok but the cluster never completes the delete. "
+                    f"Workaround: rerun with --bench-index <fresh-name>. "
+                    f"Last error: {last_err}"
+                )
+            raise last_err if last_err is not None else RuntimeError(
+                f"_reset_bench_index: timed out without ever calling "
+                f"create_index for {self._index_name!r}"
             )
 
         adapter._with_reconnect(_do_reset)
+
+    def _ensure_index_loaded(self) -> None:
+        # Call Index.load() before any score/insert request
+        import pyenvector as ev
+        last_err: Optional[Exception] = None
+        for _attempt in range(5):
+            try:
+                self._ev_client._ensure_initialized()
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(2.0)
+        if last_err is not None:
+            raise last_err
+        adapter = self._ev_client._adapter
+
+        def _do_load():
+            idx = ev.Index(self._index_name)
+            idx.load()
+
+        adapter._with_reconnect(_do_load)
+
+    def _wait_for_score_ready(
+        self, probe_vec: list, timeout_s: float = 300.0, poll_interval_s: float = 1.0
+    ) -> float:
+        """Poll score() until it returns ok; return the wait duration.
+
+        After an `await_completion=False, load=False` insert, the cluster
+        leaves the index unsearchable. This cause the next score call fails
+        with "shard list is empty" or "VCT cache not found".
+        """
+        start = time.monotonic()
+        deadline = start + timeout_s
+        last_err: Optional[str] = None
+        while time.monotonic() < deadline:
+            res = self._ev_client.score(self._index_name, probe_vec)
+            if res.get("ok"):
+                return time.monotonic() - start
+            last_err = res.get("error")
+            time.sleep(poll_interval_s)
+        raise RuntimeError(
+            f"merge-wait timed out after {timeout_s}s waiting for "
+            f"score() to recover. Last error: {last_err}"
+        )
 
     async def teardown(self) -> None:
         if self._vault is not None:
@@ -602,6 +680,11 @@ class LatencyBenchmark:
         insert_ms = t_insert.elapsed_ms
 
         total_ms = (time.perf_counter() - total_start) * 1000.0
+
+        # Wait for the next iteration starts on a clean state
+        if self.direct_envector:
+            self._wait_for_score_ready(vec)
+
         return {
             "embed": embed_ms,
             "score": score_ms,
@@ -1216,6 +1299,10 @@ class LatencyBenchmark:
         insert_ms = t_insert.elapsed_ms
 
         total_ms = (time.perf_counter() - total_start) * 1000.0
+
+        if self.direct_envector:
+            self._wait_for_score_ready(vecs[0])
+
         return {
             "embed_batch": embed_ms,
             "score": score_ms,
@@ -1327,6 +1414,7 @@ class LatencyBenchmark:
                 return
             print(f"  reset[{scenario_label}]...", end=" ", flush=True)
             self._reset_bench_index()
+            self._ensure_index_loaded()
             print("done")
 
         if run_capture:
