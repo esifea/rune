@@ -483,7 +483,82 @@ func (s *LifecycleService) DeleteCapture(ctx context.Context, args DeleteCapture
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. rune_reload_pipelines — server.py:L1046-1089. Spec §6.
+// 5. rune_configure — write Vault credentials to ~/.rune/config.json.
+//
+// Sets state=active and clears any prior dormant fields so the next boot
+// loop (or /rune:activate) can dial Vault. Does not auto-reload — the
+// caller decides when to apply changes via /rune:activate or
+// /rune:reload_pipelines.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ConfigureArgs — caller-supplied Vault credentials.
+type ConfigureArgs struct {
+	Endpoint   string `json:"endpoint"`
+	Token      string `json:"token"`
+	CACertPath string `json:"ca_cert_path,omitempty"`
+	TLSDisable bool   `json:"tls_disable,omitempty"`
+}
+
+// ConfigureResult — written-file metadata + next-step hint.
+type ConfigureResult struct {
+	OK           bool   `json:"ok"`
+	Path         string `json:"path"`
+	State        string `json:"state"`
+	ConfiguredAt string `json:"configured_at"`
+	NextStep     string `json:"next_step,omitempty"`
+}
+
+// Configure merges new Vault credentials into ~/.rune/config.json, flips
+// state to active, and clears any dormant_reason/dormant_since fields from
+// a prior /rune:deactivate or boot-side MarkDormant call. Idempotent under
+// repeated calls with the same args.
+//
+// On read failure (corrupt JSON, etc.) the existing config is discarded
+// and a fresh one written — same recovery path MarkDormant uses, since
+// overwriting bad state with a known-good config is better than crashing.
+func (s *LifecycleService) Configure(ctx context.Context, args ConfigureArgs) (*ConfigureResult, error) {
+	if args.Endpoint == "" {
+		return nil, &domain.RuneError{Code: domain.CodeInvalidInput, Message: "endpoint is required"}
+	}
+	if args.Token == "" {
+		return nil, &domain.RuneError{Code: domain.CodeInvalidInput, Message: "token is required"}
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		// File missing OR parse-failed OR perm-denied. Fall back to a
+		// fresh Config — same recovery as MarkDormant. The caller's
+		// credentials are the source of truth; we're not losing anything
+		// salvageable.
+		cfg = &config.Config{}
+	}
+
+	cfg.Vault = config.VaultConfig{
+		Endpoint:   args.Endpoint,
+		Token:      args.Token,
+		CACert:     args.CACertPath,
+		TLSDisable: args.TLSDisable,
+	}
+	cfg.State = "active"
+	cfg.DormantReason = ""
+	cfg.DormantSince = ""
+
+	if err := config.Save(cfg); err != nil {
+		return nil, fmt.Errorf("save config: %w", err)
+	}
+
+	path, _ := config.DefaultConfigPath()
+	return &ConfigureResult{
+		OK:           true,
+		Path:         path,
+		State:        cfg.State,
+		ConfiguredAt: time.Now().UTC().Format(time.RFC3339),
+		NextStep:     "Run /rune:activate to apply the new credentials (or wait for the boot loop to retry).",
+	}, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. rune_reload_pipelines — server.py:L1046-1089. Spec §6.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ReloadPipelinesResult.

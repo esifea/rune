@@ -109,6 +109,17 @@ func handleDiagnostics(deps *Deps) sdkmcp.ToolHandlerFor[emptyArgs, service.Diag
 	}
 }
 
+func handleConfigure(deps *Deps) sdkmcp.ToolHandlerFor[service.ConfigureArgs, service.ConfigureResult] {
+	return func(ctx context.Context, _ *sdkmcp.CallToolRequest, in service.ConfigureArgs) (*sdkmcp.CallToolResult, service.ConfigureResult, error) {
+		var zero service.ConfigureResult
+		out, err := deps.Lifecycle.Configure(ctx, in)
+		if err != nil {
+			return errorResult(err), zero, nil
+		}
+		return okResult(out), *out, nil
+	}
+}
+
 func handleReloadPipelines(deps *Deps) sdkmcp.ToolHandlerFor[emptyArgs, service.ReloadPipelinesResult] {
 	return func(ctx context.Context, _ *sdkmcp.CallToolRequest, _ emptyArgs) (*sdkmcp.CallToolResult, service.ReloadPipelinesResult, error) {
 		var zero service.ReloadPipelinesResult
