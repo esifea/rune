@@ -13,8 +13,10 @@
   ],
   "mcpServers": {
     "rune": {
-      "command": "${HOME}/.rune/bin/rune-mcp",
-      "description": "Rune MCP server (talks to Vault + embedder + enVector). Populated by '${CLAUDE_PLUGIN_ROOT}/bin/rune install'; before that, this path doesn't exist and the spawn fails - which the skill markdown catches and recovers from"
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/rune",
+      "args": ["mcp-server"],
+      "timeout": 30000,
+      "description": "Rune MCP server (talks to Vault + embedder + enVector). The command is the plugin's bash wrapper, which always exists at session start; on first run it self-install rune-mcp, then exec - MCP server comes online in the same session with no restart."
     }
   }
 }

@@ -7,8 +7,11 @@
 # Subcommand surface:
 #   - When ~/.rune/bin/rune already exists: delegates ALL subcommands
 #     unchanged (safety guard)
-#   - When ~/.rune/bin/rune is missing: only `install` is accepted as
-#     the bootstrap entry point
+#   - When ~/.rune/bin/rune is missing: only the subcommands that are allowed to
+#     bootstrap on a fresh machine are accepted (install, mcp-server, runed).
+#     Fresh `claude plugin install rune` automatically invoke MCP server with
+#     `${CLAUDE_PLUGIN_ROOT}/bin/rune mcp-server`, and this install rune-mcp
+#     before launch - no session restart required.
 #
 # Windows support: this wrapper is bash-only. Native Windows shells
 # (PowerShell / cmd) cannot execute this. Windows users must invoke it
@@ -18,14 +21,14 @@ set -euo pipefail
 RUNE_HOME="${RUNE_HOME:-$HOME/.rune}"
 TARGET="$RUNE_HOME/bin/rune"
 
-# Delegate to ~/.rune/bin/rune
+# Delegate to ~/.rune/bin/rune immediately
 if [ -x "$TARGET" ]; then
   exec "$TARGET" "$@"
 fi
 
 # Bootstrap path (~/.rune/bin/rune missing)
 case "${1:-}" in
-  install)
+  install|mcp-server|runed)
     ;;
   *)
     echo "rune: rune is not fully configured yet." >&2
@@ -34,6 +37,42 @@ case "${1:-}" in
     ;;
 esac
 
+# Concurrency-safe CLI download
+mkdir -p "$RUNE_HOME"
+LOCK_DIR="$RUNE_HOME/bootstrap.lock.d"
+TMP=""
+SUMS=""
+cleanup() {
+  [ -n "$TMP" ] && rm -f "$TMP"
+  [ -n "$SUMS" ] && rm -f "$SUMS"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+waited=0
+while ! mkdir "$LOCK_DIR" 2>/dev/null; do # another session hold lock
+  if [ -x "$TARGET" ]; then
+    exec "$TARGET" "$@"   # bootstrap finished
+  fi
+
+  sleep 1
+  waited=$((waited + 1))
+  if [ "$waited" -ge 120 ]; then
+    echo "rune: bootstrap lock held >120s, reclaiming" >&2
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    waited=0
+  fi
+done
+
+# Check error
+trap cleanup EXIT INT TERM
+
+if [ -x "$TARGET" ]; then
+  cleanup
+  trap - EXIT INT TERM
+  exec "$TARGET" "$@"
+fi
+
+# Lazy version evaluation
 # Priority: RUNE_VERSION > latest release (including pre-release for now)
 # TODO: switch to .../rune/releases/latest
 RUNE_VERSION="${RUNE_VERSION:-}"
@@ -85,7 +124,6 @@ mkdir -p "$(dirname "$TARGET")"
 # Download and verify
 TMP="$(mktemp -t rune-bootstrap-XXXXXX)"
 SUMS="$(mktemp -t rune-bootstrap-sums-XXXXXX)"
-trap 'rm -f "$TMP" "$SUMS"' EXIT
 
 curl --fail --silent --show-error --location "$RELEASE_BASE/$ASSET"        -o "$TMP"
 curl --fail --silent --show-error --location "$RELEASE_BASE/checksums.txt" -o "$SUMS"
@@ -109,9 +147,12 @@ if [ "$ACTUAL" != "$EXPECTED" ]; then
   exit 1
 fi
 
-# Post-download
+# Atomic publish
 chmod +x "$TMP"
 mv -f "$TMP" "$TARGET"
+TMP=""
 
 # Delegate to the freshly-installed Go binary
+cleanup
+trap - EXIT INT TERM
 exec "$TARGET" "$@"
