@@ -27,7 +27,7 @@ Dormant Since:  <timestamp>  (only when dormant with a timestamp)
 Configuration:
   [check] Config file: ~/.rune/config.json
   [check] Vault Endpoint: <url or "not set">
-  [check] enVector: <endpoint or "not set">
+  [check] Runespace: <endpoint or "not set">
 
 System Health:
   [check] Vault         : healthy / unreachable
@@ -39,7 +39,7 @@ System Health:
                           socket: <socket_path>
                           info error:   <info_error>    (only when present)
                           health error: <health_error>  (only when present)
-  [check] enVector Cloud: reachable (<latency>ms) / unreachable
+  [check] Runespace: reachable (<latency>ms) / unreachable
 
 Recommendations:
   - <actionable suggestions based on what's missing>
@@ -58,9 +58,9 @@ Use checkmarks for healthy items, X marks for issues.
 **Dormant Reason Display**: When `dormant_reason` is present in config or diagnostics, translate reason code into a user-friendly message:
 - `vault_unreachable`: "Vault server could not be reached. Check if it's running and the endpoint is correct."
 - `vault_token_invalid`: "Vault token was rejected. Token may be expired — run `/rune:configure` to update."
-- `envector_unreachable`: "enVector Cloud could not be reached. Check network and endpoint."
-- `envector_key_invalid`: "enVector API key was rejected. Contact your Vault administrator."
-- `envector_not_provisioned`: "No enVector Cloud endpoint is configured on Rune-Vault. Contact your Vault administrator."
+- `envector_unreachable`: "Runespace could not be reached. Check network and endpoint."
+- `envector_key_invalid`: "Runespace API key was rejected. Contact your Vault administrator."
+- `envector_not_provisioned`: "No Runespace endpoint is configured on Rune-Vault. Contact your Vault administrator."
 - `pipeline_init_failed`: "Pipeline initialization failed. Run `/rune:activate` to retry."
 - `user_deactivated`: "Manually deactivated by user via `/rune:deactivate`."
 - Other/unknown: show raw reason string with "Run `/rune:activate` to retry."

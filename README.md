@@ -65,7 +65,7 @@ $ gemini extensions install https://github.com/CryptoLabInc/rune.git
 You'll need from your team admin:
 - **Vault endpoint** + **token**
 
-That's all. enVector Cloud credentials are delivered automatically via the Vault bundle. On a fresh machine, `/rune:configure` also handles binary download and daemon setup in the same step.
+That's all. Runespace credentials are delivered automatically via the Vault bundle. On a fresh machine, `/rune:configure` also handles binary download and daemon setup in the same step.
 
 Don't have these? See [rune-admin](https://github.com/CryptoLabInc/rune-admin) for deployment, [setup/check-prerequisites.md](setup/check-prerequisites.md) for the full prerequisite checklist, or [examples/team-setup-example.md](examples/team-setup-example.md) for a walkthrough.
 
@@ -127,7 +127,7 @@ You don't "query" Rune. Your agent draws from it the way an experienced engineer
   ━━━━━━━━━━━━━━━━━━━━━━              ━━━━━━━━━━━━━━━━━━━━
 
   Alice's Agent ─┐
-  Bob's Agent ───┤── MCP ──► enVector Cloud (encrypted vectors)
+  Bob's Agent ───┤── MCP ──► Runespace (encrypted vectors)
   Carol's Agent ─┘               │
                             Rune-Vault (secret key holder)
                             decrypts similarity scores only
@@ -141,7 +141,7 @@ You don't "query" Rune. Your agent draws from it the way an experienced engineer
 
 Every memory is encrypted **before leaving your machine** using Fully Homomorphic Encryption (FHE).
 
-- **enVector Cloud** stores and searches **only encrypted vectors** — it cannot read your data
+- **Runespace** stores and searches **only encrypted vectors** — it cannot read your data
 - **Rune-Vault** holds the secret key and decrypts **only similarity scores** — it never sees the content
 - **Plaintext never leaves your machine**
 
@@ -176,7 +176,7 @@ Rune's capture system is modeled on how the brain forms long-term memories:
   Full conversation   ──►   Agent judges:     ──►    Stores the GIST:
   with all the              "Is this significant?"
   tangents, greetings,                                "PostgreSQL for
-  weather chat...           enVector checks:          financial data.
+  weather chat...           Runespace checks:         financial data.
                             "Is this novel?"          ACID required.
                                                       MongoDB rejected."
                             Filters ~99% out.
@@ -201,18 +201,18 @@ The memory itself acts as the filter. An empty memory captures aggressively (eve
 Rune requires two infrastructure components:
 
 1. **Rune-Vault** — Holds the team's secret key. Decrypts only similarity scores, never content. Deploy via [rune-admin](https://github.com/CryptoLabInc/rune-admin).
-2. **enVector Cloud** — Encrypted vector storage and search. Sign up at [envector.io](https://envector.io).
+2. **Runespace** — Encrypted vector storage and search. Sign up at [envector.io](https://envector.io).
 
 ### Deploying
 
 See [rune-admin](https://github.com/CryptoLabInc/rune-admin):
 1. Deploy Rune-Vault (OCI/AWS/GCP via Terraform)
-2. Create enVector Cloud account and cluster
+2. Create Runespace account and cluster
 3. Provision team index on Vault
 
 ### Onboarding Members
 
-Give each member their **Vault endpoint + token**. enVector credentials are bundled automatically.
+Give each member their **Vault endpoint + token**. Runespace credentials are bundled automatically.
 
 They install the plugin, run `/rune:configure` (or `$rune configure` in Codex), and they're connected.
 
@@ -300,13 +300,13 @@ Then reinstall from the [Install](#install) section above.
 ```
 
 `/rune:status` reports per-subsystem state (vault / encryption key / embedder /
-enVector reachability). Failures surface a recovery action on the same line.
+Runespace reachability). Failures surface a recovery action on the same line.
 
 ## Related Projects
 
 - [Rune-Admin](https://github.com/CryptoLabInc/rune-admin) — Infrastructure deployment and admin tools
-- [envector-go-sdk](https://github.com/CryptoLabInc/envector-go-sdk) — FHE encryption SDK (Go)
-- [enVector Cloud](https://envector.io) — Encrypted vector database
+- [runespace-sdk](https://github.com/CryptoLabInc/runespace-sdk) — FHE encryption SDK (Go)
+- [Runespace](https://envector.io) — Encrypted vector database
 
 ## Support
 

@@ -55,7 +55,7 @@ $ claude plugin install rune
 The plugin manifest (`.claude-plugin/plugin.json`) declares the wrapper
 path; Claude Code spawns `${CLAUDE_PLUGIN_ROOT}/bin/rune mcp-server` via
 stdio on session start (on a fresh install the wrapper self-installs
-rune-mcp first, then execs it). enVector Cloud credentials are delivered
+rune-mcp first, then execs it). Runespace credentials are delivered
 automatically via the Vault bundle — you never set `ENVECTOR_*` env vars
 directly.
 
@@ -75,7 +75,7 @@ Walks you through Vault endpoint + token + TLS choice, writes
 ```
 
 Renders per-subsystem health (Vault / EncKey / AgentDEK / Embedder /
-enVector) via the `diagnostics` MCP tool.
+Runespace) via the `diagnostics` MCP tool.
 
 ### Dev mode (running from a local clone)
 
@@ -174,12 +174,12 @@ into `MCPServerStdio`.
 ## Multi-Agent Collaboration
 
 Each agent spawns its own MCP server process; shared state is
-maintained via enVector Cloud (encrypted vectors) and Rune-Vault
+maintained via Runespace (encrypted vectors) and Rune-Vault
 (decryption keys).
 
 ```
 Claude ──→ rune-mcp (stdio) ──┐
-                              ├──→ enVector Cloud (encrypted)
+                              ├──→ Runespace (encrypted)
 Gemini ──→ rune-mcp (stdio) ──┤       └──→ Rune-Vault (secret key)
                               │
 GPT    ──→ rune-mcp (stdio) ──┘
@@ -219,7 +219,7 @@ cat ~/.rune/config.json
 # vault.endpoint, vault.token, ca_cert, tls_disable, state
 ```
 
-enVector credentials are delivered automatically via the Vault bundle
+Runespace credentials are delivered automatically via the Vault bundle
 at boot — they live in memory only and are not stored locally. You do
 NOT need to set `ENVECTOR_ENDPOINT` or `ENVECTOR_API_KEY`.
 

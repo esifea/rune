@@ -17,7 +17,7 @@ This guide shows how a team administrator sets up Rune infrastructure and onboar
 
 ## Step 1: Alice Deploys Rune-Vault
 
-Alice runs the interactive installer, which handles cloud provisioning, TLS setup, and enVector Cloud configuration:
+Alice runs the interactive installer, which handles cloud provisioning, TLS setup, and Runespace configuration:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CryptoLabInc/rune-admin/main/install.sh \
@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/CryptoLabInc/rune-admin/main/instal
 
 The installer guides her through:
 - **Cloud provider** selection (OCI / AWS / GCP)
-- **enVector Cloud** credentials (endpoint + API key)
+- **Runespace** credentials (endpoint + API key)
 - **TLS certificate** generation
 - **Terraform-based** VM provisioning
 
@@ -81,7 +81,7 @@ I've set up our team's organizational memory system. Here are your credentials:
   Vault Endpoint: vault-acme.oci.envector.io:50051
   Vault Token: evt_acme_bob_xyz789
 
-enVector Cloud credentials are delivered automatically via the Vault
+Runespace credentials are delivered automatically via the Vault
 bundle — no action needed on your end.
 
 Setup:
@@ -198,7 +198,7 @@ Bob's token is immediately invalidated. Alice and Carol continue uninterrupted.
 - No knowledge loss when Alice is on vacation
 
 ### Zero-Knowledge Privacy
-- enVector Cloud sees only encrypted vectors
+- Runespace sees only encrypted vectors
 - Only team members with valid Vault tokens can decrypt
 - Cloud provider cannot read any content
 

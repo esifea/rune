@@ -46,7 +46,7 @@ Then write `~/.rune/config.json` with this structure (chmod 600 after writing):
 }
 ```
 
-Note: enVector credentials are no longer stored locally — they are delivered automatically via the Vault bundle at session start.
+Note: Runespace credentials are no longer stored locally — they are delivered automatically via the Vault bundle at session start.
 
 After writing the config, show a summary:
 

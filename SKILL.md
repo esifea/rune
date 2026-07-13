@@ -44,7 +44,7 @@ commands into cross-agent/common instructions.
    - `state` is `"active"` → **Go to Active State**
    - Otherwise → **Go to Dormant State**
 
-**Note**: enVector credentials are NOT in `~/.rune/config.json`. They are
+**Note**: Runespace credentials are NOT in `~/.rune/config.json`. They are
 delivered via the Vault bundle at runtime when the boot loop dials Vault.
 
 **IMPORTANT**: Do NOT attempt to ping Vault or make network requests during
@@ -107,7 +107,7 @@ If in Active state but operations fail:
       - Show warning: "This should only be used for local development. All gRPC traffic will be sent in plaintext."
       - → config: `ca_cert: ""`, `tls_disable: true`
 
-   Note: enVector credentials are delivered automatically via the Vault bundle — no user input needed.
+   Note: Runespace credentials are delivered automatically via the Vault bundle — no user input needed.
 
 4. Call the `configure` MCP tool with the collected values
    (`endpoint`, `token`, `ca_cert_path`, `tls_disable`). The server does
@@ -116,8 +116,8 @@ If in Active state but operations fail:
    The agent never writes the config file itself.
 5. Call the `activate` MCP tool to bring pipelines online. It runs the
    prereq checks server-side and drives the boot loop: dials Vault,
-   fetches the agent manifest (EncKey + enVector creds), connects to
-   enVector, and transitions to Active.
+   fetches the agent manifest (EncKey + Runespace creds), connects to
+   Runespace, and transitions to Active.
 6. Confirm health by calling `diagnostics` and applying the
    **Boot Failure — Fast-Fail Rule** (see section below). If
    `vault.last_boot_error` is present, surface its `hint` verbatim
@@ -149,7 +149,7 @@ System Health (from diagnostics):
   ✓ Encryption Key : loaded (key_id: <id>)
   ✓ Agent DEK      : loaded
   ✓ Embedder       : <model> (<mode>, dim=<vector_dim>)
-  ✓ enVector Cloud : reachable (<latency>ms)
+  ✓ Runespace      : reachable (<latency>ms)
 
 Recommendations:
   - If Dormant: /rune:configure to (re)trigger the boot loop
@@ -405,7 +405,7 @@ When users ask questions about past decisions, automatically search organization
 
 **Zero-Knowledge Encryption**:
 - All data stored as FHE-encrypted vectors
-- enVector Cloud cannot read plaintext
+- Runespace cannot read plaintext
 - Only team members with Vault access can decrypt
 
 **Credential Storage**:
@@ -428,7 +428,7 @@ Check activation state with `/rune:status` (or `$rune status` for Codex CLI)
 2. Check Vault is accessible: `curl <vault-url>/health`
 3. Reconfigure with `/rune:configure` (or `$rune configure` for Codex CLI)
 
-### enVector not provisioned?
+### Runespace not provisioned?
 Vault admin must configure `ENVECTOR_ENDPOINT` and `ENVECTOR_API_KEY` on the Vault server. Contact your Vault administrator.
 
 ### Need to switch teams?

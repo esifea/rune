@@ -22,9 +22,9 @@ This authenticates you to access your team's Vault. Keep this secure and never s
 
 ---
 
-## enVector Cloud (Automatic)
+## Runespace (Automatic)
 
-enVector Cloud credentials (endpoint, API key) are delivered automatically via the Vault bundle at startup. You do not need to obtain or configure them separately. Your team administrator manages enVector setup as part of the Vault deployment.
+Runespace credentials (endpoint, API key) are delivered automatically via the Vault bundle at startup. You do not need to obtain or configure them separately. Your team administrator manages Runespace setup as part of the Vault deployment.
 
 ---
 
@@ -44,8 +44,8 @@ Great! Run `/rune:configure` to set up your credentials and activate the plugin.
 
 If your team hasn't deployed Rune-Vault yet, see the [full Rune deployment guide](https://github.com/CryptoLabInc/rune-admin).
 
-#### enVector credentials?
-enVector credentials are delivered automatically via the Vault bundle. If you see enVector errors, contact your team administrator to verify the Vault deployment includes enVector configuration.
+#### Runespace credentials?
+Runespace credentials are delivered automatically via the Vault bundle. If you see Runespace errors, contact your team administrator to verify the Vault deployment includes Runespace configuration.
 
 ---
 
@@ -57,7 +57,7 @@ Once configured with `/rune:configure`:
 - **Automatic context capture**: Claude will automatically identify and store significant organizational decisions
 - **Context retrieval**: Ask Claude about past decisions and get full context
 - **Team sharing**: All team members with the same Vault see the same organizational memory
-- **Zero-knowledge security**: enVector Cloud never sees plaintext data
+- **Zero-knowledge security**: Runespace never sees plaintext data
 
 ### Example Usage
 
